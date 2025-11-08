@@ -1,167 +1,170 @@
 #!/usr/bin/env python3
 """
-Antenna pattern sweep with NanoVNA + motor controller.
+NanoVNA + MotorController antenna pattern sweep (RadioFunctions-style, fixed motion).
 
-- Rotates 0..355° in 5° steps (absolute moves using MotorController.rotate_mast)
-- At each angle: sweep 1–3 GHz and log S11/S21 (complex + |.| in dB) to CSV.
+- Angles: 0..355° in 5° steps (absolute setpoints) but controller receives RELATIVE X moves.
+- Sweep: 1–3 GHz at each angle, logging S11/S21 complex + dB.
 - Safety:
-    * Validates NanoVNA returns data before any motion.
-    * Verifies each move completed (±0.5°), with one automatic retry.
-- Clean shutdown: returns to ~0°, closes CSV and device handles.
+  * Validate NanoVNA path before any motion.
+  * Home/reset orientation, then verify every move (query MPos if available).
+  * Always rotate forward (monotonic increasing) to avoid backtracking/wrap bugs.
 
-Requirements:
-    pip install pynanovna pyserial numpy
-
-Notes:
-  - Logs S11 and S21 (2-port NanoVNA). S12/S22 usually require a second pass or reversing DUT.
-  - Uses your MotorController from MotorController.py.
+CSV columns:
+  angle_deg, freq_Hz, S11_re, S11_im, S21_re, S21_im, S11_dB, S21_dB
 """
 
 import csv
 import sys
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple
 
 import numpy as np
 import pynanovna  # NanoVNA control
 
-# --- USER SETTINGS ------------------------------------------------------------
+# ---- USER SETTINGS -----------------------------------------------------------
 MOTOR_PORT      = "/dev/ttyACM0"   # e.g., "COM5" on Windows
 MOTOR_BAUD      = 115200
 SWEEP_START_HZ  = 1_000_000_000
 SWEEP_STOP_HZ   = 3_000_000_000
-SWEEP_POINTS    = 101              # 101/201/401 are typical; keep modest
-ANGLE_STEP_DEG  = 5.0              # 0,5,...,355 (no 360 duplicate)
-SETTLE_S        = 0.20             # pause after each move before measuring
+SWEEP_POINTS    = 401              # 101/201/401 are typical
+ANGLE_STEP_DEG  = 5.0              # 0,5,...,355 (avoid 360 which == 0)
+SETTLE_S        = 0.20             # pause after each move
 ANGLE_TOL_DEG   = 0.5              # verification tolerance
 CSV_PATH        = Path("nanovna_pattern_1to3GHz.csv")
 
-# --- IMPORT YOUR MOTOR CONTROLLER --------------------------------------------
-from MotorController import MotorController  # provided by you
+# ---- Your MotorController (relative, GRBL-like) ------------------------------
+from MotorController import MotorController  # provided in your project
 
 
-# --- SMALL HELPERS ------------------------------------------------------------
+# ---- Helpers (RadioFunctions-friendly) ---------------------------------------
 def db20(x):
     x = np.asarray(x)
     return 20.0 * np.log10(np.clip(np.abs(x), 1e-12, None))
 
 
-def ang_err(a, b):
-    """Smallest signed angular error a−b in degrees (wrap-aware)."""
-    # Map difference to (-180, 180]
-    return ((a - b + 180.0) % 360.0) - 180.0
-
-
-def read_mast_deg(mc: MotorController, *, fallback_internal: bool = True) -> Optional[float]:
+def query_mast_deg(mc: MotorController) -> Optional[float]:
     """
-    Try controller-report angle first; fall back to mc.get_current_angles().
-    Returns mast (deg) or None if unavailable.
+    Read mast angle from controller ('?'=>MPos:x,y,...) or fall back to software angle.
+    RadioFunctions uses both paths (controller query and internal stored angles). 
     """
     try:
-        tup = mc._get_controller_angles()  # expected (mast, arm, ...) in deg
+        tup = mc._get_controller_angles()  # returns (mast_angle, arm_angle) as strings/nums
         if tup is not None:
             return float(tup[0])
     except Exception:
         pass
-    if fallback_internal:
-        try:
-            mast, _ = mc.get_current_angles()
-            return float(mast)
-        except Exception:
-            return None
-    return None
+    try:
+        mast, _ = mc.get_current_angles()
+        return float(mast)
+    except Exception:
+        return None
 
 
-def goto_abs(mc: MotorController, target_deg: float, *, tol: float, settle_s: float) -> float:
+def rel_move_to_abs_forward(mc: MotorController, target_abs_deg: float) -> bool:
     """
-    Command absolute angle (0..360 wrap), verify within tol; single automatic retry.
-    Returns readback mast angle (deg).
-    Raises RuntimeError on failure.
+    Convert desired ABSOLUTE angle into a RELATIVE move that always goes forward (positive)
+    modulo 360. Your controller's rotate_mast() sends a relative 'G1 X<amount>' move and
+    accumulates internal angles. We avoid commanding 360 (duplicate of 0). 
     """
-    target = float(target_deg) % 360.0
+    cur = query_mast_deg(mc)
+    if cur is None:
+        # If no reading is possible, just attempt absolute-as-relative from 0 baseline
+        cur = 0.0
+    target = float(target_abs_deg) % 360.0
+    cur    = float(cur) % 360.0
+    # Forward delta: how far to move positively from current to target
+    delta_fwd = (target - cur) % 360.0
+    if delta_fwd == 0.0:
+        return True  # already there
+    # Issue RELATIVE move via rotate_mast (controller expects relative) 
+    ok = mc.rotate_mast(delta_fwd)
+    return bool(ok)
 
-    # Issue absolute move
-    if not mc.rotate_mast(target):
+
+def goto_abs_forward(mc: MotorController, target_abs_deg: float, *, tol: float, settle_s: float) -> float:
+    """
+    Drive forward to absolute angle (0..360 wrap) using relative G1 moves under the hood.
+    Verify within 'tol' degrees using controller query when available; retry once if needed.
+    """
+    target = float(target_abs_deg) % 360.0
+
+    if not rel_move_to_abs_forward(mc, target):
+        # retry once
         time.sleep(0.3)
-        if not mc.rotate_mast(target):
+        if not rel_move_to_abs_forward(mc, target):
             raise RuntimeError(f"Motor refused move to {target:.2f}°")
 
-    # Let mechanics settle
     time.sleep(settle_s)
 
-    # Verify
-    rb = read_mast_deg(mc)
+    rb = query_mast_deg(mc)
     if rb is None:
         raise RuntimeError("Cannot read mast angle from controller.")
-    if abs(ang_err(rb, target)) > tol:
-        # One corrective retry
-        if not mc.rotate_mast(target):
+    # error with wrap-awareness
+    err = ((rb - target + 180.0) % 360.0) - 180.0
+    if abs(err) > tol:
+        # corrective forward nudge (rare, due to rounding/gear play)
+        if not rel_move_to_abs_forward(mc, target):
             raise RuntimeError(f"Motor refused corrective move to {target:.2f}°")
         time.sleep(settle_s)
-        rb = read_mast_deg(mc)
-        if rb is None or abs(ang_err(rb, target)) > tol:
+        rb = query_mast_deg(mc)
+        if rb is None:
+            raise RuntimeError("Cannot read mast angle after corrective move.")
+        err = ((rb - target + 180.0) % 360.0) - 180.0
+        if abs(err) > tol:
             raise RuntimeError(f"Angle verify miss: wanted {target:.2f}°, got {rb:.2f}°")
-    return rb
+    return float(rb)
 
 
-# --- MAIN ROUTINE -------------------------------------------------------------
+# ---- Main --------------------------------------------------------------------
 def main():
-    # 1) Connect motor (no motion yet)
+    # 0) Connect motor (no motion yet)
     mc = MotorController(MOTOR_PORT, MOTOR_BAUD)
     if not mc.connect():
         print("ERROR: Motor controller failed to connect.", file=sys.stderr)
         return 1
     print("Motor connected.")
 
-    # 2) Connect NanoVNA and validate data path BEFORE any motion
+    # 1) Connect NanoVNA and validate BEFORE any motion
     try:
         vna = pynanovna.VNA()  # auto-detect
-    except Exception as e:
-        print(f"ERROR: Failed to open NanoVNA: {e}", file=sys.stderr)
-        mc.disconnect()
-        return 1
-
-    try:
         vna.set_sweep(SWEEP_START_HZ, SWEEP_STOP_HZ, SWEEP_POINTS)
         print("Validating NanoVNA sweep…")
-        s11, s21, freqs = vna.sweep()  # complex arrays + frequency vector
+        s11, s21, freqs = vna.sweep()
         if not (len(freqs) and len(s11) == len(freqs) and len(s21) == len(freqs)):
-            print("ERROR: NanoVNA returned no/short data—check connection/permissions.", file=sys.stderr)
+            print("ERROR: NanoVNA returned no/short data; check cable/perm.", file=sys.stderr)
             mc.disconnect()
             return 1
-        print(f"VNA OK: {len(freqs)} pts {freqs[0]/1e9:.3f}→{freqs[-1]/1e9:.3f} GHz.")
+        print(f"VNA OK: {len(freqs)} pts {freqs[0]/1e9:.3f}→{freqs[-1]/1e9:.3f} GHz")
     except Exception as e:
         print(f"ERROR: NanoVNA validation failed: {e}", file=sys.stderr)
         mc.disconnect()
         return 1
 
-    # 3) Prepare CSV
+    # 2) Prepare CSV
     CSV_PATH.parent.mkdir(parents=True, exist_ok=True)
     f = CSV_PATH.open("w", newline="")
     writer = csv.writer(f)
-    writer.writerow([
-        "angle_deg", "freq_Hz",
-        "S11_re", "S11_im", "S21_re", "S21_im",
-        "S11_dB", "S21_dB",
-    ])
+    writer.writerow(["angle_deg","freq_Hz","S11_re","S11_im","S21_re","S21_im","S11_dB","S21_dB"])
 
     try:
-        # 4) Home/zero like your RF helpers; best-effort
+        # 3) Home / reset orientation like RadioFunctions.InitMotor does
         try:
-            mc.reset_orientation()
+            mc.reset_orientation()  # homes + zeroes internal angles
             time.sleep(0.25)
         except Exception:
             pass
 
-        # Move to 0° and verify before any sweep
-        rb0 = goto_abs(mc, 0.0, tol=ANGLE_TOL_DEG, settle_s=SETTLE_S)
+        # Move to 0° and verify
+        rb0 = goto_abs_forward(mc, 0.0, tol=ANGLE_TOL_DEG, settle_s=SETTLE_S)
         print(f"At start angle ≈ {rb0:.2f}°")
 
-        # 5) Angle loop (absolute, exclude 360)
-        angles = np.arange(0.0, 360.0, ANGLE_STEP_DEG, dtype=float)  # 0..355
+        # 4) Absolute target list: 0, 5, ..., 355 (never 360)
+        angles = np.arange(0.0, 360.0, ANGLE_STEP_DEG, dtype=float)
+
+        # 5) Main sweep
         for target in angles:
-            rb = goto_abs(mc, target, tol=ANGLE_TOL_DEG, settle_s=SETTLE_S)
+            rb = goto_abs_forward(mc, target, tol=ANGLE_TOL_DEG, settle_s=SETTLE_S)
 
             # Sweep and log
             s11, s21, freqs = vna.sweep()
@@ -185,23 +188,17 @@ def main():
 
         print(f"\nDone. CSV saved to: {CSV_PATH.resolve()}")
 
-        # Return to 0° cleanly (no full-circle wrap)
-        goto_abs(mc, 0.0, tol=ANGLE_TOL_DEG, settle_s=SETTLE_S)
+        # 6) Return to 0° cleanly (no “full wrap”)
+        goto_abs_forward(mc, 0.0, tol=ANGLE_TOL_DEG, settle_s=SETTLE_S)
 
     finally:
         # Cleanup
-        try:
-            f.close()
-        except Exception:
-            pass
-        try:
-            mc.disconnect()
-        except Exception:
-            pass
-        try:
-            vna.close()  # harmless if not supported
-        except Exception:
-            pass
+        try: f.close()
+        except Exception: pass
+        try: mc.disconnect()
+        except Exception: pass
+        try: vna.close()
+        except Exception: pass
 
     return 0
 
