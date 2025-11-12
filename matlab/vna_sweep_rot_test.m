@@ -5,10 +5,10 @@
 clear; clc; close all;
 
 %% 1) File paths & main knobs
-scanCsv = 'nanovna_pattern_1to3GHz 11_8_2025_lp.csv';   % NanoVNA sweep CSV
-anFile  = 'log_sp1_E.txt';                            % anechoic baseline
+scanCsv = 'nanovnaf_pattern_3_6.csv';   % NanoVNA sweep CSV
+anFile  = 'vivald_E.txt';                            % anechoic baseline
 freq_c  = 2.4e9;                                      % comparison frequency (Hz)
-angStep = 5;                                          % resample grid (deg)
+angStep = 3;                                          % resample grid (deg)
 gate_ns = 4;                                         % time gate end (ns) for LP transform
 td_window = 'hann';                                   % LP transform window: 'hann'|'kaiser'|'none'
 
@@ -19,6 +19,7 @@ td_window = 'hann';                                   % LP transform window: 'ha
 anechoic_norm_dB = A_amp_dB - max(A_amp_dB);
 % Angle grid for plotting
 angGrid = 0:angStep:355;
+
 
 % Individual plots: Anechoic
 plot_dataset_normalized('Anechoic (baseline)', freq_c, angGrid, ...

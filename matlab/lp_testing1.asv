@@ -1,0 +1,425 @@
+%Antenna Results MDE - F25-05  (LP step, smoothing & interpolation + optional BANDPASS @ 2.4 GHz)
+% Y-axis mirror option for Scan (and optional BP) + Peaks/Nulls comparison
+% 11/08/2025
+
+%% 0) Housekeeping
+clear; clc; close all;
+
+%% 1) File paths & knobs
+scanCsv = 'nanovnaf_pattern_4_6_outside_w_box.csv';   % NanoVNA sweep CSV
+anFile  = 'vivald_E.txt';                               % anechoic baseline
+freq_c  = e9;                                         % comparison frequency (Hz)
+angStep = 3;                                             % output angle grid (deg)
+
+% Smoothing options for the ANGULAR patterns (post-normalization)
+SMOOTH.use     = true;
+SMOOTH.method  = 'sgolay';    % 'sgolay' | 'movmean' | 'none'
+SMOOTH.win     = 7;           % odd window length (5–11 typical)
+SMOOTH.poly    = 2;           % sgolay order (<= win-1)
+SMOOTH.movN    = 5;           % moving-average window if method='movmean'
+
+% Display of Low-Pass impulse/step at one angle (for understanding; no gating)
+LP.window      = 'hann';      % 'hann'|'kaiser'|'none'
+LP.show_angle  = 0;           % which angle to display impulse+step (nearest)
+
+% Band-pass transform (diagnostic only, no gating) — disabled by default
+BP.enable      = false;       % set true to see BP impulse + polar compare
+BP.window      = 'hann';      % 'hann'|'kaiser'|'none'
+BP.show_angle  = 0;           % angle to show BP impulse (nearest)
+
+% NEW: Flip options (mirror across Y-axis)
+FLIP.scan      = true;        % flip the SCAN across Y-axis
+FLIP.bandpass  = true;        % if BP enabled, also flip the BP metric
+
+% NEW: Peaks/Nulls comparison knobs
+PN.tol_deg       = 5;   % angle match tolerance (degrees)
+PN.min_prom_dB   = 3;   % minimum prominence to count a peak/null (dB)
+PN.make_plots    = true;
+
+%% 2) Load & prepare anechoic baseline (normalized)
+[A_deg, A_amp_dB] = load_anechoic_at_freq(anFile, freq_c*1e-9);
+A_amp_norm_dB     = A_amp_dB - max(A_amp_dB);
+
+%% 3) Load NanoVNA scan and extract per-angle data
+T = readtable(scanCsv);
+need = {'angle_deg','freq_Hz','S21_re','S21_im','S21_dB'};
+assert(all(ismember(need, T.Properties.VariableNames)), ...
+    'CSV must contain: %s', strjoin(need,', '));
+
+angles_scan = unique(T.angle_deg(:).','stable');
+Per = struct('ang',[],'f',[],'H',[]);
+Per(numel(angles_scan)).ang = [];
+
+for k = 1:numel(angles_scan)
+    sub = T(T.angle_deg==angles_scan(k),:);
+    [f,ix] = sort(sub.freq_Hz);
+    H = sub.S21_re(ix) + 1j*sub.S21_im(ix);
+    Per(k).ang = angles_scan(k);
+    Per(k).f   = f(:);
+    Per(k).H   = H(:);
+end
+
+% RAW scan pattern at freq_c (normalized)
+scan_raw_dB = zeros(size(angles_scan));
+for k = 1:numel(angles_scan)
+    f = Per(k).f; H = Per(k).H;
+    [~,iC] = min(abs(f - freq_c));
+    scan_raw_dB(k) = 20*log10(abs(H(iC))+1e-15);
+end
+scan_raw_norm_dB = scan_raw_dB - max(scan_raw_dB);
+
+%% 4) Interpolate to common grid and (optionally) smooth (no gating)
+angGrid = 0:angStep:355;
+
+ane_on_grid  = resample_circular(A_deg,       A_amp_norm_dB,   angGrid);
+scan_on_grid = resample_circular(angles_scan, scan_raw_norm_dB, angGrid);
+
+if SMOOTH.use
+    scan_on_grid = smooth_angular(scan_on_grid, SMOOTH);
+    % comment next line if you want the anechoic untouched
+    ane_on_grid  = smooth_angular(ane_on_grid,  SMOOTH);
+end
+
+%% 5) Flip SCAN across Y-axis (theta -> 180° - theta) if requested
+if FLIP.scan
+    scan_on_grid = flip_y_axis_on_grid(angGrid, scan_on_grid);
+    fprintf('Applied Y-axis flip to SCAN (θ -> 180° - θ).\n');
+end
+
+%% 6) Plot individual datasets (normalized)
+plot_dataset_normalized('Anechoic (baseline)', freq_c, angGrid, ane_on_grid);
+plot_dataset_normalized('Scan (interp+smooth, Y-flipped as set)', freq_c, angGrid, scan_on_grid);
+
+%% 7) Compare (normalized): Scan vs Anechoic
+compare_two_patterns('Scan vs Anechoic (No time gating)', ...
+    freq_c, angGrid, scan_on_grid, ane_on_grid);
+
+% Quick console stats
+err = scan_on_grid - ane_on_grid;
+fprintf('\n--- Comparison @ %.3f GHz (No time gating) ---\n', freq_c*1e-9);
+fprintf('MAE  = %.2f dB\n', mean(abs(err),'omitnan'));
+fprintf('RMSE = %.2f dB\n', sqrt(mean(err.^2,'omitnan')));
+
+%% 8) LP display at one angle (for reference only; no gating)
+repAngLP = pick_nearest_angle(angles_scan, LP.show_angle);
+subLP    = T(T.angle_deg==repAngLP,:);
+[fLP,ix] = sort(subLP.freq_Hz);
+HLP      = subLP.S21_re(ix) + 1j*subLP.S21_im(ix);
+[t_lp, h_lp, s_lp] = vna_like_lowpass_impulse(fLP, HLP, LP.window);
+
+figure('Name',sprintf('LP Impulse & Step @ %d° (no gating)', repAngLP),'Color','w');
+subplot(2,1,1); plot(t_lp*1e9, abs(h_lp),'LineWidth',1.2); grid on;
+xlabel('Time (ns)'); ylabel('|Impulse| (linear)'); title('Low-Pass Impulse (0 \rightarrow F_{nyq})');
+subplot(2,1,2); plot(t_lp*1e9, abs(s_lp),'LineWidth',1.2); grid on;
+xlabel('Time (ns)'); ylabel('|Step| (linear)');   title('Low-Pass Step Response');
+
+%% 9) Optional: Band-pass envelope metric + polar compare (diagnostic only)
+if BP.enable
+    bp_metric = zeros(size(angles_scan));       % envelope peak per angle
+    for k = 1:numel(angles_scan)
+        f = Per(k).f; H = Per(k).H;
+        [~, ~, env_bp] = vna_like_bandpass_impulse(f, H, freq_c, BP.window);
+        bp_metric(k) = max(env_bp);             % no gating: use envelope peak
+    end
+    % Convert to dB & normalize pattern, then interpolate/smooth
+    bp_dB = 20*log10(max(bp_metric, eps));
+    bp_dB = bp_dB - max(bp_dB);
+    bp_on_grid = resample_circular(angles_scan, bp_dB, angGrid);
+    if SMOOTH.use, bp_on_grid = smooth_angular(bp_on_grid, SMOOTH); end
+
+    % Flip BP pattern too (to match SCAN's handedness), if requested
+    if FLIP.bandpass
+        bp_on_grid = flip_y_axis_on_grid(angGrid, bp_on_grid);
+        fprintf('Applied Y-axis flip to BANDPASS pattern.\n');
+    end
+
+    % Polar compare: BP vs Anechoic
+    compare_two_patterns('Band-pass (envelope peak) vs Anechoic (No gating)', ...
+        freq_c, angGrid, bp_on_grid, ane_on_grid);
+end
+
+%% 10) Peaks & Nulls comparison (Scan vs Anechoic)
+fprintf('\n========== Peaks & Nulls Comparison ==========\n');
+compare_peaks_nulls(angGrid, ane_on_grid, angGrid, scan_on_grid, ...
+    'Scan', PN.tol_deg, PN.min_prom_dB, PN.make_plots);
+fprintf('==============================================\n');
+
+%% ============================ Helpers ============================
+
+function yq = resample_circular(x_deg, y_dB, xq_deg)
+    % Wrap, collapse duplicate angles, pad ±360, interpolate (linear)
+    wrap = @(x) mod(x,360);
+    [xu, yu] = collapse_duplicates(wrap(x_deg(:)), y_dB(:));
+    [xp, yp] = periodic_pad(xu, yu);
+    yq = interp1(xp, yp, mod(xq_deg,360), 'linear');
+end
+
+function [xu, yu] = collapse_duplicates(x, y)
+    tol = 1e-9;
+    xr = round(x/tol)*tol;
+    [~,~,ic] = unique(xr,'stable');
+    xu = accumarray(ic, x, [], @mean);
+    yu = accumarray(ic, y, [], @mean);
+    [xu,s] = sort(xu); yu = yu(s);
+end
+
+function [xp, yp] = periodic_pad(x, y)
+    xp = [x-360; x; x+360];
+    yp = [y;     y; y    ];
+    [xp,s] = sort(xp); yp = yp(s);
+end
+
+function y = smooth_angular(y, S)
+    y = y(:).';
+    switch lower(S.method)
+        case 'sgolay'
+            if exist('sgolayfilt','file')==2
+                win = max(3, S.win + mod(S.win+1,2)); % enforce odd
+                poly = min(S.poly, win-1);
+                y = sgolayfilt(y, poly, win);
+            else
+                y = movmean(y, max(3,S.win));
+            end
+        case 'movmean'
+            y = movmean(y, max(3,S.movN));
+        otherwise
+            % none
+    end
+end
+
+function plot_dataset_normalized(labelStr, freq_c, angGrid, patt_dB)
+    lin = 10.^(patt_dB/20);
+    figure('Color','w','Name',[labelStr ' (Polar)']);
+    if exist('polarpattern','file')==2
+        polarpattern(angGrid, patt_dB,'LineWidth',1.4);
+        title(sprintf('%s @ %.3f GHz (Normalized dB)', labelStr, freq_c*1e-9));
+    else
+        polarplot(deg2rad(angGrid), lin,'LineWidth',1.6); rlim([0 1]); grid on;
+        title(sprintf('%s @ %.3f GHz (Normalized linear)', labelStr, freq_c*1e-9));
+    end
+    figure('Color','w','Name',[labelStr ' (dB vs Angle)']);
+    plot(angGrid, patt_dB,'LineWidth',1.6); grid on; ylim([-40 0]);
+    xlabel('Angle (deg)'); ylabel('Normalized Gain (dB)');
+    title(sprintf('%s @ %.3f GHz', labelStr, freq_c*1e-9));
+end
+
+function compare_two_patterns(titleStr, freq_c, angGrid, patt1_dB, patt2_dB)
+    lin1 = 10.^(patt1_dB/20); lin2 = 10.^(patt2_dB/20);
+    figure('Color','w','Name',[titleStr ' (Polar)']);
+    if exist('polarpattern','file')==2
+        polarpattern(angGrid, patt1_dB,'b-','LineWidth',1.4); hold on;
+        polarpattern(angGrid, patt2_dB,'r-','LineWidth',1.4);
+        legend('Scan','Anechoic','Location','southoutside');
+        title(sprintf('%s @ %.3f GHz (Normalized dB)', titleStr, freq_c*1e-9));
+    else
+        polarplot(deg2rad(angGrid), lin1,'LineWidth',1.6); hold on; grid on;
+        polarplot(deg2rad(angGrid), lin2,'LineWidth',1.6);
+        rlim([0 1]); legend('Scan','Anechoic','Location','southoutside');
+        title(sprintf('%s @ %.3f GHz (Normalized linear)', titleStr, freq_c*1e-9));
+    end
+    figure('Color','w','Name',[titleStr ' (dB overlay)']);
+    plot(angGrid, patt1_dB,'LineWidth',1.6); hold on; grid on;
+    plot(angGrid, patt2_dB,'LineWidth',1.6);
+    xlabel('Angle (deg)'); ylabel('Normalized Gain (dB)'); ylim([-40 0]);
+    legend('Scan','Anechoic','Location','southoutside');
+    title(sprintf('%s (dB) @ %.3f GHz', titleStr, freq_c*1e-9));
+    figure('Color','w','Name',[titleStr ' Error (dB)']);
+    plot(angGrid, patt1_dB - patt2_dB, 'LineWidth',1.4); grid on; ylim([-20 20]);
+    xlabel('Angle (deg)'); ylabel('Scan - Anechoic (dB)');
+    title(sprintf('Error vs Angle @ %.3f GHz', freq_c*1e-9));
+end
+
+function [A_deg, A_amp_dB] = load_anechoic_at_freq(anFile, freqGHz)
+    fid = fopen(anFile,'r'); assert(fid>0, 'Cannot open %s', anFile);
+    first = fgetl(fid);
+    pPos  = strfind(first,'Phase');  assert(~isempty(pPos), 'Header must contain "Phase".');
+    ampSeg = strtrim(first(1:pPos-1));
+    aPos  = strfind(ampSeg,'Amp');   assert(~isempty(aPos),  'Header must contain "Amp".');
+    nums  = regexp(ampSeg(aPos+3:end),'([\d]+\.?[\d]*)','match');
+    freqs = str2double(nums);        % GHz list
+    Nf = numel(freqs);
+    C = textscan(fid, repmat('%f',1,3+Nf+Nf), 'Delimiter',{' ','\t',','}, ...
+        'MultipleDelimsAsOne',true);
+    fclose(fid);
+    A_deg = C{2}(:).';
+    ampMat = zeros(numel(A_deg), Nf);
+    for i = 1:Nf, ampMat(:,i) = C{3+i}; end
+    [~,iF] = min(abs(freqs - freqGHz));
+    A_amp_dB = ampMat(:,iF).';
+end
+
+function [t_s, h_imp, s_step] = vna_like_lowpass_impulse(freq_Hz, H_complex, windowName)
+    % Build a 0..Fnyq spectrum from band-limited S-parameters and IFFT it
+    [f,ix] = sort(freq_Hz(:)); H = H_complex(:); H = H(ix);
+    df  = median(diff(f));
+    fun = (f(1):df:f(end)).';
+    if numel(fun)~=numel(f) || max(abs(f - fun)) > max(1,1e-9*df)
+        Hr = interp1(f, real(H), fun, 'linear','extrap');
+        Hi = interp1(f, imag(H), fun, 'linear','extrap');
+        f  = fun; H = Hr + 1j*Hi;
+    end
+    Fnyq = f(end);
+    Npos = floor(Fnyq/df) + 1;
+    fpos = (0:Npos-1).' * df;
+    Hpos = zeros(Npos,1);
+    i0 = round(f(1)/df) + 1;
+    i1 = min(i0 + numel(f) - 1, Npos);
+    Hpos(i0:i1) = H(1:(i1-i0+1));
+    switch lower(windowName)
+        case 'hann',   w = hann(Npos);
+        case 'kaiser', w = kaiser(Npos,6);
+        otherwise,     w = ones(Npos,1);
+    end
+    Hpos = Hpos .* w;
+    Hfull = [Hpos; conj(Hpos(end-1:-1:2))];
+    h_imp = ifft(Hfull, 'symmetric');
+    fs = 2*Fnyq; dt = 1/fs;
+    t_s = (0:numel(h_imp)-1).' * dt;
+    s_step = cumsum(h_imp) * dt;
+end
+
+function [t_s, h_bp, env_bp, meta] = vna_like_bandpass_impulse(freq_Hz, H_complex, f_center_Hz, windowName)
+    % VNA-like BAND-PASS transform (centered at f_center_Hz), no gating
+    [f,ix] = sort(freq_Hz(:)); H = H_complex(:); H = H(ix);
+    df  = median(diff(f));
+    fun = (f(1):df:f(end)).';
+    if numel(fun)~=numel(f) || max(abs(f - fun)) > max(1,1e-9*df)
+        Hr = interp1(f, real(H), fun, 'linear','extrap');
+        Hi = interp1(f, imag(H), fun, 'linear','extrap');
+        f  = fun; H = Hr + 1j*Hi;
+    end
+    % Offset spectrum about center
+    f_off = f - f_center_Hz;
+    Bspan = f(end) - f(1);
+    fs    = Bspan;              % baseband sampling rate
+    dt    = 1/fs;
+    df_off = df;
+    fgrid = (-Bspan/2:df_off:Bspan/2).';
+    Hbb = interp1(f_off, H, fgrid, 'linear', 0);
+    switch lower(windowName)
+        case 'hann',   w = hann(numel(Hbb));
+        case 'kaiser', w = kaiser(numel(Hbb), 6);
+        otherwise,     w = ones(numel(Hbb),1);
+    end
+    Hbb_win = Hbb .* w;
+    h_bp = ifft(ifftshift(Hbb_win));   % complex BP impulse
+    t_s  = (0:numel(h_bp)-1).' * dt;
+    env_bp = abs(h_bp);
+    meta.fs   = fs;
+    meta.span = Bspan;
+    meta.df   = df_off;
+end
+
+function r = rms(x), r = sqrt(mean(x.^2,'omitnan')); end
+function a = pick_nearest_angle(angList, target), [~,i]=min(abs(angList-target)); a=angList(i); end
+
+% ------------ Mirror across Y-axis on an existing uniform angle grid ----------
+function y_flip = flip_y_axis_on_grid(angGrid, y)
+% Reflect pattern across the Y-axis (θ -> 180° - θ) on a uniform grid.
+% Works exactly (index arithmetic) when angGrid is 0:angStep:355.
+    N = numel(angGrid);
+    step = angGrid(2) - angGrid(1);
+    k = round(angGrid/step);                       % 0..N-1
+    tgt = mod(round(180/step) - k, N) + 1;         % target indices
+    y_flip = y(tgt);
+end
+
+% --------------------------- Peaks/Nulls utilities ---------------------------
+function compare_peaks_nulls(deg_ref, dB_ref, deg_run, dB_run, runName, tol_deg, min_prom_dB, make_plots)
+    % Ensure column vectors
+    deg_ref = deg_ref(:); dB_ref = dB_ref(:);
+    deg_run = deg_run(:); dB_run = dB_run(:);
+
+    % Main lobe
+    [refMain, iRef] = max(dB_ref); refMainA = deg_ref(iRef);
+    [runMain, iRun] = max(dB_run); runMainA = deg_run(iRun);
+    fprintf('Main lobe: Ref %.1f° / %.2f dB  |  %s %.1f° / %.2f dB  |  Δ=%.2f dB\n', ...
+        refMainA, refMain, runName, runMainA, runMain, runMain - refMain);
+
+    % Peaks (positive prominence)
+    [pkRef, angPkRef] = local_find_peaks(dB_ref, deg_ref, min_prom_dB);
+    [pkRun, angPkRun] = local_find_peaks(dB_run, deg_run, min_prom_dB);
+
+    fprintf('\n--- Peaks (±%.1f° match, prom ≥ %.1f dB) ---\n', tol_deg, min_prom_dB);
+    for i = 1:numel(angPkRef)
+        a  = angPkRef(i);
+        vb = pkRef(i);
+        [vr, ar, ok] = nearest_at_angle(a, angPkRun, pkRun, tol_deg);
+        if ~ok, vr = circinterp1(deg_run, dB_run, a); ar = NaN; end
+        fprintf('Peak @ %6.1f° | Ref: %7.2f dB | %s: %7.2f dB (%s) | Δ: %+7.2f dB\n', ...
+            a, vb, runName, vr, ternary(isnan(ar),'interp',sprintf('match %.1f°',ar)), vr - vb);
+    end
+
+    % Nulls (use peaks on negated signal)
+    [nlRef, angNlRef] = local_find_nulls(dB_ref, deg_ref, min_prom_dB);
+    [nlRun, angNlRun] = local_find_nulls(dB_run, deg_run, min_prom_dB);
+
+    fprintf('\n--- Nulls (±%.1f° match, prom ≥ %.1f dB) ---\n', tol_deg, min_prom_dB);
+    for i = 1:numel(angNlRef)
+        a  = angNlRef(i);
+        vb = nlRef(i);
+        [vr, ar, ok] = nearest_at_angle(a, angNlRun, nlRun, tol_deg);
+        if ~ok, vr = circinterp1(deg_run, dB_run, a); ar = NaN; end
+        fprintf('Null @ %6.1f° | Ref: %7.2f dB | %s: %7.2f dB (%s) | Δ: %+7.2f dB\n', ...
+            a, vb, runName, vr, ternary(isnan(ar),'interp',sprintf('match %.1f°',ar)), vr - vb);
+    end
+
+    if make_plots
+        figure('Color','w','Name','Peaks/Nulls markers');
+        plot(deg_ref, dB_ref,'k-','LineWidth',1.1); hold on; grid on;
+        plot(deg_run, dB_run,'b-','LineWidth',1.1);
+        plot(angPkRef, pkRef,'ko','MarkerFaceColor','k');      % ref peaks
+        plot(angPkRun, pkRun,'bo','MarkerFaceColor','b');      % run peaks
+        plot(angNlRef, nlRef,'ks','MarkerFaceColor','w');      % ref nulls
+        plot(angNlRun, nlRun,'bs','MarkerFaceColor','w');      % run nulls
+        xlabel('Angle (deg)'); ylabel('Normalized Gain (dB)'); ylim([-40 0]);
+        legend('Ref (Anechoic)','Run (Scan)','Ref peaks','Run peaks','Ref nulls','Run nulls');
+        title('Peaks/Nulls Markers');
+    end
+end
+
+function [pks, ang] = local_find_peaks(p_dB, deg, min_prom_dB)
+    p_dB = p_dB(:); deg = deg(:);
+    [pks, locs] = findpeaks(p_dB, 'MinPeakProminence', min_prom_dB);
+    ang = deg(locs);
+end
+
+function [nls, ang] = local_find_nulls(p_dB, deg, min_prom_dB)
+    p_dB = p_dB(:); deg = deg(:);
+    [ninv, locs] = findpeaks(-p_dB, 'MinPeakProminence', min_prom_dB);
+    nls = -ninv; ang = deg(locs);
+end
+
+function [val_at_match, angle_match, ok] = nearest_at_angle(target_deg, ang_list, val_list, tol_deg)
+    if isempty(ang_list)
+        val_at_match = NaN; angle_match = NaN; ok = false; return;
+    end
+    d = circangdist_deg(ang_list, target_deg);
+    [dmin, idx] = min(abs(d));
+    if dmin <= tol_deg
+        val_at_match = val_list(idx);
+        angle_match  = ang_list(idx);
+        ok = true;
+    else
+        val_at_match = NaN; angle_match = NaN; ok = false;
+    end
+end
+
+function d = circangdist_deg(a, b)
+    d = mod(a - b + 180, 360) - 180;
+end
+
+function v = circinterp1(theta_deg, y, xq_deg)
+    theta = theta_deg(:);
+    y     = y(:);
+    xq    = mod(xq_deg, 360);
+
+    th_ext = [theta(1)-360; theta; theta(end)+360];
+    y_ext  = [y(end); y; y(1)];
+
+    v = interp1(th_ext, y_ext, xq, 'linear');
+end
+
+function out = ternary(cond, a, b)
+    if cond, out = a; else, out = b; end
+end

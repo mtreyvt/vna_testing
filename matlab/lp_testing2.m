@@ -1,0 +1,641 @@
+%Antenna Results MDE - F25-05
+% LP step + smoothing + interpolation + Time-Gate + Hilbert-style
+% + Auto-rotation (RMSE-minimizing) to align with anechoic
+% + Peaks/Nulls comparison (pre- & post-rotation)
+% + Wavelet denoise and 0°-safe polar plotting
+% 11/08/2025
+
+%% 0) Housekeeping
+clear; clc; close all;
+
+%% 1) File paths & knobs
+scanCsv = 'nanovnaf_pattern_4_6_REVERB.csv';   % angle_deg,freq_Hz,S21_re,S21_im,S21_dB
+anFile = 'vivald_E.txt';   % new file name (matches the uploaded file)                              % anechoic baseline
+freq_c  = 2.4e9;                                          % Hz
+angStep = 3;                                              % deg (assumed uniform grid later)
+
+% --- Optional flip (mirror) across polar "y-axis" so 0° ↔ 180°
+FLIP.flipAcrossY = true;   % set false if your motor orientation is already consistent
+FLIP.offset_deg  = 0;      % extra static rotation if you know it (+ = CCW)
+
+% --- Angular smoothing (post-normalization)
+SMOOTH.use     = true;
+SMOOTH.method  = 'sgolay'; % 'sgolay' | 'movmean' | 'none'
+SMOOTH.win     = 7;        % odd window length
+SMOOTH.poly    = 2;
+SMOOTH.movN    = 5;
+
+% --- Wavelet denoise (circular, padding-safe)
+WAVE.use      = true;         % turn on/off wavelet denoise
+WAVE.domain   = 'dB';         % 'dB' (operate directly on dB) or 'linear' (denoise mag, then dB)
+WAVE.name     = 'coif5';      % 'coif5','sym6','db8' etc.
+WAVE.method   = 'UniversalThreshold';   % 'UniversalThreshold','SURE','Bayes'
+WAVE.rule     = 'Soft';       % 'Soft' or 'Hard'
+WAVE.noise    = 'LevelDependent';   % 'LevelDependent' or 'LevelIndependent'
+WAVE.levels   = [];           % [] => auto; else integer (e.g., 4 or 5)
+WAVE.pad      = 16;           % circular pad samples on both sides
+WAVE.cyclespin= 8;            % 0=off; 4–12 typical
+
+% --- LP (VNA-like) demo plot at one angle (no gating; for intuition)
+LP.show_angle  = 0;           % nearest angle to show LP impulse/step (set [] to skip)
+LP.window      = 'hann';
+
+% --- Band-pass impulse meta used by both corrections
+BP.window      = 'hann';
+
+% === TIME-GATING params ===
+TG.width_ns    = 20;           % gate width (ns)
+TG.padFactor   = 4;           % IFFT zero-padding factor for finer time resolution
+TG.demoAngle   = 0;           % show time-domain gating at this angle
+
+% === HILBERT-style params (sliding low-pass windows averaged) ===
+HF.M           = 5;           % number of sliding windows
+HF.alpha       = 0.75;        % fraction toward first reflection (0..1)
+HF.padFactor   = 4;           % IFFT zero-padding factor
+HF.demoAngle   = 0;           % show Hilbert windows at this angle
+
+% === AUTO-ROTATION optimizer ===
+AR.enable      = true;        % optimize rotation of Baseline/TG/HF vs anechoic
+AR.method      = 'rmse';      % 'rmse' or 'xcorr'
+AR.make_plots  = true;
+
+% === Peaks/Nulls comparison controls ===
+PN.tol_deg     = 5;           % ± angle tolerance to match features
+PN.min_prom    = 3;           % dB prominence threshold
+
+%% 2) Load anechoic baseline (normalized @ freq_c)
+[A_deg, A_amp_dB] = load_anechoic_at_freq(anFile, freq_c*1e-9);
+A_amp_norm_dB     = A_amp_dB - max(A_amp_dB);
+
+%% 3) Load NanoVNA scan and extract RAW pattern @ freq_c (normalized)
+T = readtable(scanCsv);
+need = {'angle_deg','freq_Hz','S21_re','S21_im','S21_dB'};
+assert(all(ismember(need, T.Properties.VariableNames)), ...
+    'CSV must contain: %s', strjoin(need,', '));
+
+angles_scan = unique(T.angle_deg(:).','stable');
+Per = struct('ang',[],'f',[],'H',[]);
+Per(numel(angles_scan)).ang = [];
+scan_raw_dB = zeros(size(angles_scan));
+
+for k = 1:numel(angles_scan)
+    sub = T(T.angle_deg==angles_scan(k),:);
+    [f,ix] = sort(sub.freq_Hz);
+    H      = sub.S21_re(ix) + 1j*sub.S21_im(ix);
+    Per(k).ang = angles_scan(k);
+    Per(k).f   = f(:);
+    Per(k).H   = H(:);
+    [~,iC]     = min(abs(f - freq_c));
+    scan_raw_dB(k) = 20*log10(abs(H(iC))+1e-15);
+end
+scan_raw_norm_dB = scan_raw_dB - max(scan_raw_dB);
+
+%% 4) Interpolate both patterns to a common grid, optional flip, smooth + wavelet
+angGrid = 0:angStep:355;
+
+% Optional flip across polar y-axis: theta' = mod(180 - theta + offset, 360)
+if FLIP.flipAcrossY
+    angles_scan = mod(180 - angles_scan + FLIP.offset_deg, 360);
+else
+    angles_scan = mod(angles_scan + FLIP.offset_deg, 360);
+end
+
+ane_on_grid  = resample_circular(A_deg,       A_amp_norm_dB,   angGrid);
+base_on_grid = resample_circular(angles_scan, scan_raw_norm_dB, angGrid);
+
+if SMOOTH.use
+    base_on_grid = smooth_angular(base_on_grid, SMOOTH);
+    ane_on_grid  = smooth_angular(ane_on_grid,  SMOOTH); % comment if you want baseline untouched
+end
+if WAVE.use
+    base_on_grid = wavelet_denoise_circular(base_on_grid, WAVE);
+    ane_on_grid  = wavelet_denoise_circular(ane_on_grid,  WAVE); % comment to keep raw baseline
+end
+
+% --- Baseline comparison (pre-rotation) with 0°-safe plotting
+compare_two_patterns('Baseline (Scan vs Anechoic) — pre-rotation', ...
+    freq_c, angGrid, base_on_grid, ane_on_grid);
+
+%% 5) TIME-GATING correction (per-angle band-pass impulse -> gate -> FFT)
+[tg_on_grid] = time_gate_pattern(Per, angles_scan, angGrid, freq_c, TG, BP, SMOOTH);
+if WAVE.use, tg_on_grid = wavelet_denoise_circular(tg_on_grid, WAVE); end
+compare_two_patterns('Time-Gated vs Anechoic — pre-rotation', ...
+    freq_c, angGrid, tg_on_grid, ane_on_grid);
+
+%% 6) HILBERT-style sliding filters (per-angle; averaged)
+[hf_on_grid] = hilbert_style_pattern(Per, angles_scan, angGrid, freq_c, HF, BP, SMOOTH);
+if WAVE.use, hf_on_grid = wavelet_denoise_circular(hf_on_grid, WAVE); end
+compare_two_patterns('Hilbert-style vs Anechoic — pre-rotation', ...
+    freq_c, angGrid, hf_on_grid, ane_on_grid);
+
+%% 7) Scores & Peaks/Nulls BEFORE rotation
+score_and_report('Baseline (pre-rot)',     base_on_grid, ane_on_grid, angGrid);
+score_and_report('Time-Gated (pre-rot)',   tg_on_grid,   ane_on_grid, angGrid);
+score_and_report('Hilbert-style (pre-rot)',hf_on_grid,   ane_on_grid, angGrid);
+
+compare_peaks_nulls(angGrid, ane_on_grid, angGrid, base_on_grid, 'Baseline pre-rot', PN);
+compare_peaks_nulls(angGrid, ane_on_grid, angGrid, tg_on_grid,   'Time-Gated pre-rot', PN);
+compare_peaks_nulls(angGrid, ane_on_grid, angGrid, hf_on_grid,   'Hilbert-style pre-rot', PN);
+
+%% 8) Auto-rotation: find angle that best matches anechoic (RMSE-minimizing)
+if AR.enable
+    [base_rot, base_deg] = optimize_rotation(ane_on_grid, base_on_grid, angGrid, AR.method);
+    [tg_rot,   tg_deg  ] = optimize_rotation(ane_on_grid, tg_on_grid,   angGrid, AR.method);
+    [hf_rot,   hf_deg  ] = optimize_rotation(ane_on_grid, hf_on_grid,   angGrid, AR.method);
+
+    fprintf('\n=== Auto-rotation (method: %s) ===\n', upper(AR.method));
+    fprintf('Baseline optimal rotation: %+d°\n', base_deg);
+    fprintf('Time-Gated optimal rotation: %+d°\n', tg_deg);
+    fprintf('Hilbert-style optimal rotation: %+d°\n', hf_deg);
+
+    % Plots after rotation (0°-safe)
+    compare_two_patterns(sprintf('Baseline — post-rotation (%+d°)', base_deg), ...
+        freq_c, angGrid, base_rot, ane_on_grid);
+    compare_two_patterns(sprintf('Time-Gated — post-rotation (%+d°)', tg_deg), ...
+        freq_c, angGrid, tg_rot,   ane_on_grid);
+    compare_two_patterns(sprintf('Hilbert-style — post-rotation (%+d°)', hf_deg), ...
+        freq_c, angGrid, hf_rot,   ane_on_grid);
+
+    % Scores & Peaks/Nulls AFTER rotation
+    score_and_report('Baseline (post-rot)',     base_rot, ane_on_grid, angGrid);
+    score_and_report('Time-Gated (post-rot)',   tg_rot,   ane_on_grid, angGrid);
+    score_and_report('Hilbert-style (post-rot)',hf_rot,   ane_on_grid, angGrid);
+
+    if AR.make_plots
+        peaks_nulls_markers(angGrid, ane_on_grid, base_rot,   'Baseline post-rot');
+        peaks_nulls_markers(angGrid, ane_on_grid, tg_rot,     'Time-Gated post-rot');
+        peaks_nulls_markers(angGrid, ane_on_grid, hf_rot,     'Hilbert-style post-rot');
+    end
+
+    % Console comparisons (post-rot)
+    compare_peaks_nulls(angGrid, ane_on_grid, angGrid, base_rot, 'Baseline post-rot', PN);
+    compare_peaks_nulls(angGrid, ane_on_grid, angGrid, tg_rot,   'Time-Gated post-rot', PN);
+    compare_peaks_nulls(angGrid, ane_on_grid, angGrid, hf_rot,   'Hilbert-style post-rot', PN);
+end
+
+%% 9) LP display at one angle (reference only)
+if ~isempty(LP.show_angle)
+    repAngLP = pick_nearest_angle(unique(mod(angles_scan,360)), LP.show_angle);
+    subLP    = T(T.angle_deg==repAngLP,:);
+    if ~isempty(subLP)
+        [fLP,ix] = sort(subLP.freq_Hz);
+        HLP      = subLP.S21_re(ix) + 1j*subLP.S21_im(ix);
+        [t_lp, h_lp, s_lp] = vna_like_lowpass_impulse(fLP, HLP, LP.window);
+        figure('Name',sprintf('LP Impulse & Step @ %d° (no gating)', repAngLP),'Color','w');
+        subplot(2,1,1); plot(t_lp*1e9, abs(h_lp),'LineWidth',1.2); grid on;
+        xlabel('Time (ns)'); ylabel('|Impulse|'); title('Low-Pass Impulse (0 \rightarrow F_{nyq})');
+        subplot(2,1,2); plot(t_lp*1e9, abs(s_lp),'LineWidth',1.2); grid on;
+        xlabel('Time (ns)'); ylabel('|Step|');   title('Low-Pass Step Response');
+    end
+end
+
+%% ============================ Helpers ============================
+
+function [A_deg, A_amp_dB] = load_anechoic_at_freq(anFile, freqGHz)
+    fid = fopen(anFile,'r'); 
+    assert(fid>0, 'Cannot open %s', anFile);
+
+    header = fgetl(fid);
+    assert(ischar(header), 'Empty header in %s', anFile);
+
+    hasAmp = ~isempty(regexpi(header,'Amplitude','once'));
+    hasPhs = ~isempty(regexpi(header,'Phase','once'));
+
+    if hasAmp && hasPhs
+        % ---------- "Amplitude ... Phase ..." header (e.g., vivald_E.txt) ----------
+        ampNums = regexp(header, '(?<=Amplitude)[^\r\n]*?(?=Phase)', 'match', 'once');
+        phsNums = regexp(header, '(?<=Phase)[^\r\n]*$',            'match', 'once');
+        ampGHz  = sscanf(ampNums, '%f').';
+        phsGHz  = sscanf(phsNums, '%f').';
+        Nf = numel(ampGHz);
+        assert(Nf>0, 'No amplitude frequencies parsed from header.');
+
+        % Read table:  M  Adeg  Bdeg  [Amp(1..Nf)]  [Phase(1..Nf)]
+        fmt = ['%f %f %f ' repmat('%f ',1,Nf) repmat('%f ',1,Nf)];
+        C   = textscan(fid, fmt, 'Delimiter', {' ','\t',','}, ...
+                       'MultipleDelimsAsOne', true, 'CollectOutput', true);
+        fclose(fid);
+
+        % With CollectOutput=true, everything numeric is in C{1}
+        M = C{1};                                     % size: [Nrows, 3+2*Nf]
+        assert(size(M,2) >= 3+2*Nf, 'Parsed fewer columns than expected.');
+
+        MAB      = M(:, 1:3);                          % [M A B]
+        ampMat   = M(:, 4 : 3+Nf);                     % amplitudes (dB)
+        % phaseMat = M(:, 3+Nf+1 : 3+2*Nf);            % phases (deg) (unused)
+
+        A_deg = MAB(:,2).';                            % angle column
+        [~,iF] = min(abs(ampGHz - freqGHz));           % pick closest freq
+        A_amp_dB = ampMat(:, iF).';
+
+    else
+        % ---------- Fallback: "Amp ... Phase ..." style header ----------
+        pPos  = strfind(header,'Phase');  
+        assert(~isempty(pPos), 'Header must contain "Phase".');
+
+        ampSeg = strtrim(header(1:pPos-1));
+        aPos   = strfind(ampSeg,'Amp');   
+        assert(~isempty(aPos), 'Header must contain "Amp".');
+
+        nums   = regexp(ampSeg(aPos+3:end),'([\d]+\.?[\d]*)','match');
+        freqs  = str2double(nums);   % GHz list
+        Nf     = numel(freqs);
+
+        C = textscan(fid, repmat('%f',1,3+Nf+Nf), ...
+                     'Delimiter', {' ','\t',','}, ...
+                     'MultipleDelimsAsOne', true);
+        fclose(fid);
+
+        A_deg  = C{2}(:).';
+        ampMat = zeros(numel(A_deg), Nf);
+        for i = 1:Nf, ampMat(:,i) = C{3+i}; end
+
+        [~, iF]   = min(abs(freqs - freqGHz));
+        A_amp_dB  = ampMat(:, iF).';
+    end
+end
+
+
+
+function yq = resample_circular(x_deg, y_dB, xq_deg)
+    wrap = @(x) mod(x,360);
+    [xu, yu] = collapse_duplicates(wrap(x_deg(:)), y_dB(:));
+    [xp, yp] = periodic_pad(xu, yu);
+    yq = interp1(xp, yp, mod(xq_deg,360), 'linear');
+end
+
+function [xu, yu] = collapse_duplicates(x, y)
+    tol = 1e-9;
+    xr = round(x/tol)*tol;
+    [~,~,ic] = unique(xr,'stable');
+    xu = accumarray(ic, x, [], @mean);
+    yu = accumarray(ic, y, [], @mean);
+    [xu,s] = sort(xu); yu = yu(s);
+end
+
+function [xp, yp] = periodic_pad(x, y)
+    xp = [x-360; x; x+360];
+    yp = [y;     y; y];
+    [xp,s] = sort(xp); yp = yp(s);
+end
+
+function y = smooth_angular(y, S)
+    y = y(:).';
+    switch lower(S.method)
+        case 'sgolay'
+            if exist('sgolayfilt','file')==2
+                win = max(3, S.win + mod(S.win+1,2));
+                poly = min(S.poly, win-1);
+                y = sgolayfilt(y, poly, win);
+            else
+                y = movmean(y, max(3,S.win));
+            end
+        case 'movmean'
+            y = movmean(y, max(3,S.movN));
+        otherwise
+    end
+end
+% -------- Wavelet denoise (circular, version-agnostic) --------
+function out = wavelet_denoise_circular(x_dB, W)
+    x = x_dB(:);
+
+    % Circular pad to avoid seam artifacts at 0/360°
+    pad = max(1, W.pad);
+    xpad = [x(end-pad+1:end); x; x(1:pad)];
+
+    % Choose working domain
+    switch lower(W.domain)
+        case 'linear', xwork = 10.^(xpad/20);
+        otherwise,      xwork = xpad;
+    end
+
+    % Pick levels if empty (best effort)
+    L = W.levels;
+    if isempty(L)
+        try
+            L = max(3, min(6, wmaxlev(length(xwork), W.name)));
+        catch
+            L = 5; % generic default
+        end
+    end
+
+    % Single denoise pass that tries several APIs
+    function y = denoise_once(sig)
+        % Try modern wdenoise with name-value args
+        try
+            y = wdenoise(sig, ...
+                'Wavelet',        W.name, ...
+                'NumLevels',      L, ...
+                'DenoisingMethod',W.method, ...
+                'ThresholdRule',  W.rule, ...
+                'NoiseEstimate',  W.noise);
+            return;
+        catch, end
+        % Try older wdenoise signature: wdenoise(x,Level,'Wavelet',wname)
+        try
+            y = wdenoise(sig, L, 'Wavelet', W.name);
+            return;
+        catch, end
+        % Try classic wden: wden(x,TPTR,SORH,SCAL,N,'wname')
+        try
+            % 'sqtwolog' universal, soft, level-dependent (sln)
+            y = wden(sig, 'sqtwolog', 's', 'sln', L, W.name);
+            return;
+        catch, end
+        % No wavelet functions available → passthrough
+        y = sig;
+    end
+
+    % Optional cycle spinning for better shift invariance
+    K = max(0, W.cyclespin);
+    if K <= 1
+        xden = denoise_once(xwork);
+    else
+        acc = zeros(size(xwork));
+        for s = 0:K-1
+            xs  = circshift(xwork,  s);
+            xd  = denoise_once(xs);
+            acc = acc + circshift(xd, -s);
+        end
+        xden = acc / K;
+    end
+
+    % Return to dB if we denoised in linear
+    switch lower(W.domain)
+        case 'linear', xden_db = 20*log10(max(xden, eps));
+        otherwise,      xden_db = xden;
+    end
+
+    % Unpad and re-normalize to 0 dB peak
+    out = xden_db(pad+1:end-pad).';
+    out = out - max(out);
+end
+
+
+% ========== Plotting with "0°-safe" trace (wrap + half-bin rotate to move seam) ==========
+function [angP, pattP] = polar_safe(angGrid, patt_dB)
+    % Append a copy at 360° to ensure closure and rotate by half-bin
+    step = angGrid(2)-angGrid(1);
+    angP  = [angGrid, 360];
+    pattP = [patt_dB, patt_dB(1)];
+    % small shift moves the seam off 0° tick to avoid visual clipping
+    angP  = mod(angP + step/2, 360);
+end
+
+function compare_two_patterns(titleStr, freq_c, angGrid, patt1_dB, patt2_dB)
+    [a1, p1] = polar_safe(angGrid, patt1_dB);
+    [a2, p2] = polar_safe(angGrid, patt2_dB);
+
+    figure('Color','w','Name',[titleStr ' (Polar)']);
+    if exist('polarpattern','file')==2
+        polarpattern(a1, p1,'b-','LineWidth',1.4); hold on;
+        polarpattern(a2, p2,'r-','LineWidth',1.4);
+        legend('Scan','Anechoic','Location','southoutside');
+        title(sprintf('%s @ %.3f GHz (Normalized dB)', titleStr, freq_c*1e-9));
+    else
+        polarplot(deg2rad(a1), 10.^(p1/20),'LineWidth',1.6); hold on; grid on;
+        polarplot(deg2rad(a2), 10.^(p2/20),'LineWidth',1.6);
+        rlim([0 1]); legend('Scan','Anechoic','Location','southoutside');
+        title(sprintf('%s @ %.3f GHz (Normalized linear)', titleStr, freq_c*1e-9));
+    end
+
+    figure('Color','w','Name',[titleStr ' (dB overlay)']);
+    plot([angGrid,360], [patt1_dB, patt1_dB(1)],'LineWidth',1.6); hold on; grid on;
+    plot([angGrid,360], [patt2_dB, patt2_dB(1)],'LineWidth',1.6);
+    xlim([0 360]); xticks(0:30:360);
+    xlabel('Angle (deg)'); ylabel('Normalized Gain (dB)'); ylim([-40 0]);
+    legend('Scan','Anechoic','Location','southoutside');
+    title(sprintf('%s (dB) @ %.3f GHz', titleStr, freq_c*1e-9));
+
+    figure('Color','w','Name',[titleStr ' Error (dB)']);
+    err = patt1_dB - patt2_dB;
+    plot([angGrid,360], [err, err(1)], 'LineWidth',1.4); grid on; ylim([-20 20]);
+    xlim([0 360]); xticks(0:30:360);
+    xlabel('Angle (deg)'); ylabel('Scan - Anechoic (dB)');
+    title(sprintf('Error vs Angle @ %.3f GHz', freq_c*1e-9));
+end
+
+function score_and_report(name, patt_dB, ref_dB, angGrid)
+    e   = patt_dB - ref_dB;
+    MAE = mean(abs(e),'omitnan');
+    RMSE= sqrt(mean(e.^2,'omitnan'));
+    fprintf('\n--- %s vs Anechoic @ grid %.0f° ---\n', name, mean(diff(angGrid)));
+    fprintf('MAE  = %.2f dB\n', MAE);
+    fprintf('RMSE = %.2f dB\n', RMSE);
+end
+
+%% ================= Time-gating path =================
+function [pat_on_grid] = time_gate_pattern(Per, angles_scan, angGrid, f0, TG, BP, SMOOTH)
+    c  = numel(angles_scan);
+    pat = zeros(1,c);
+    for k = 1:c
+        f = Per(k).f; H = Per(k).H;
+        [t, h_bp, env_bp, ~] = bandpass_impulse(f, H, f0, BP.window, TG.padFactor);
+        [~,iLoS] = max(env_bp);
+        dt  = t(2)-t(1);
+        L   = max(5, round((TG.width_ns*1e-9)/dt));
+        i1  = max(1, iLoS - floor(L/2));
+        i2  = min(numel(t), iLoS + ceil(L/2));
+        gate= zeros(size(t)); gate(i1:i2) = hann(i2-i1+1);
+        hg   = h_bp .* gate;
+        Hc   = fft(fftshift(hg));       % back to baseband spectrum
+        amp  = abs(Hc(1));              % DC bin (baseband gain proxy)
+        pat(k) = 20*log10(max(amp,eps));
+    end
+    pat = pat - max(pat);
+    pat_on_grid = resample_circular(angles_scan, pat, angGrid);
+    if SMOOTH.use, pat_on_grid = smooth_angular(pat_on_grid, SMOOTH); end
+end
+
+%% =============== Hilbert-style sliding filters path =================
+function [pat_on_grid] = hilbert_style_pattern(Per, angles_scan, angGrid, f0, HF, BP, SMOOTH)
+    c  = numel(angles_scan);
+    pat = zeros(1,c);
+    for k = 1:c
+        f = Per(k).f; H = Per(k).H;
+        [t, h_bp, env_bp, ~] = bandpass_impulse(f, H, f0, BP.window, HF.padFactor);
+
+        [~,iLoS] = max(env_bp);
+        env = env_bp; env(1:iLoS) = 0;
+        [~,locs] = findpeaks(env,'NPeaks',1,'SortStr','descend');
+        if isempty(locs), iRef = min(numel(env), iLoS + round(8e-9/(t(2)-t(1))));
+        else, iRef = locs(1); end
+
+        iEnd = round(iLoS + HF.alpha*(iRef - iLoS));
+        iEnd = max(iLoS+2, min(iEnd, numel(t)-1));
+
+        Hsum = 0; idxs = round(linspace(iLoS, iEnd, HF.M));
+        for m = 1:HF.M
+            width = max(5, round((iEnd - iLoS)/(2 + m/2)));
+            i1 = max(1, idxs(m) - floor(width/2));
+            i2 = min(numel(t), idxs(m) + ceil(width/2));
+            w  = zeros(size(t)); w(i1:i2) = hann(i2-i1+1);
+            Hsum = Hsum + fft(fftshift(h_bp .* w));
+        end
+        Havg = Hsum / HF.M;
+        amp  = abs(Havg(1));
+        pat(k) = 20*log10(max(amp,eps));
+    end
+    pat = pat - max(pat);
+    pat_on_grid = resample_circular(angles_scan, pat, angGrid);
+    if SMOOTH.use, pat_on_grid = smooth_angular(pat_on_grid, SMOOTH); end
+end
+
+%% ---- Common band-pass impulse builder (uniform grid + IFFT) ----
+function [t_s, h_bp, env_bp, meta] = bandpass_impulse(freq_Hz, H_complex, f_center_Hz, windowName, padFactor)
+    [f,ix] = sort(freq_Hz(:)); H = H_complex(:); H = H(ix);
+    df  = median(diff(f));
+    fun = (f(1):df:f(end)).';
+    if numel(fun)~=numel(f) || max(abs(f - fun)) > max(1,1e-9*df)
+        Hr = interp1(f, real(H), fun, 'linear','extrap');
+        Hi = interp1(f, imag(H), fun, 'linear','extrap');
+        f  = fun; H = Hr + 1j*Hi;
+    end
+    Bspan = f(end)-f(1);
+    Hbb   = H;   % already centered when we ifftshift (baseband around f0)
+    switch lower(windowName)
+        case 'hann',   w = hann(numel(Hbb));
+        case 'kaiser', w = kaiser(numel(Hbb),6);
+        otherwise,     w = ones(numel(Hbb),1);
+    end
+    HbbZ = ifftshift(Hbb .* w);
+    N    = numel(HbbZ);
+    Np   = 2^nextpow2(N*padFactor);
+    h_bp = ifft(HbbZ, Np);
+    fs   = Bspan;  dt = 1/fs;
+    t_s  = (0:Np-1).' * dt;
+    env_bp = abs(h_bp);
+    meta.fs = fs; meta.span = Bspan; meta.df = df;
+end
+
+function a = pick_nearest_angle(angList, target), [~,i]=min(abs(angList-target)); a=angList(i); end
+
+%% --------- Auto-rotation utilities (uniform 0:angStep:355 grid) ---------
+function [rot_dB, best_deg] = optimize_rotation(ref_dB, run_dB, angGrid, method)
+    steps = 0:numel(angGrid)-1;
+    best_deg = 0; best_score = inf; rot_dB = run_dB;
+    switch lower(method)
+        case 'xcorr'
+            best_score = -Inf; % maximize correlation
+            for s = steps
+                c = circshift(run_dB, [0 s]);
+                r = corr(ref_dB(:), c(:), 'rows','complete');
+                if r > best_score, best_score = r; rot_dB = c; best_deg = s*(angGrid(2)-angGrid(1)); end
+            end
+        otherwise % 'rmse'
+            for s = steps
+                c = circshift(run_dB, [0 s]);
+                e = c - ref_dB;
+                rmse = sqrt(mean(e.^2,'omitnan'));
+                if rmse < best_score, best_score = rmse; rot_dB = c; best_deg = s*(angGrid(2)-angGrid(1)); end
+            end
+    end
+end
+
+function peaks_nulls_markers(angGrid, ref_dB, run_dB, tag)
+    [pkR, locR] = findpeaks(ref_dB, 'MinPeakProminence', 3);
+    [pkU, locU] = findpeaks(run_dB, 'MinPeakProminence', 3);
+    [nlR, lnr]  = findpeaks(-ref_dB, 'MinPeakProminence', 3);
+    [nlU, lnu]  = findpeaks(-run_dB, 'MinPeakProminence', 3);
+    figure('Color','w','Name',['Peaks/Nulls markers — ' tag]);
+    plot([angGrid,360], [ref_dB, ref_dB(1)],'k-','LineWidth',1.1); hold on; grid on;
+    plot([angGrid,360], [run_dB, run_dB(1)],'b-','LineWidth',1.1);
+    plot(angGrid(locR), pkR,'ko','MarkerFaceColor','k');
+    plot(angGrid(locU), pkU,'bo','MarkerFaceColor','b');
+    plot(angGrid(lnr), -nlR,'ks','MarkerFaceColor','w');
+    plot(angGrid(lnu), -nlU,'bs','MarkerFaceColor','w');
+    xlim([0 360]); xticks(0:30:360);
+    xlabel('Angle (deg)'); ylabel('Normalized Gain (dB)'); ylim([-40 0]);
+    legend('Anechoic','Run','Ref peaks','Run peaks','Ref nulls','Run nulls','Location','best');
+    title(['Peaks/Nulls — ' tag]);
+end
+
+%% ---- Peaks/Nulls console comparison with angle matching ----
+function compare_peaks_nulls(deg_ref, ref_dB, deg_run, run_dB, tag, PN)
+    if nargin<6
+        PN.tol_deg=5; PN.min_prom=3;
+    end
+    fprintf('\n==== Peaks/Nulls Comparison: %s ====\n', tag);
+    [pkR, locR] = findpeaks(ref_dB, 'MinPeakProminence', PN.min_prom);
+    [nlR, lnr]  = findpeaks(-ref_dB, 'MinPeakProminence', PN.min_prom);
+    [pkU, locU] = findpeaks(run_dB, 'MinPeakProminence', PN.min_prom);
+    [nlU, lnu]  = findpeaks(-run_dB, 'MinPeakProminence', PN.min_prom);
+
+    fprintf('Peaks: (angle)  ref_dB  run_dB  ΔdB  [match]\n');
+    for i=1:numel(locR)
+        ang = deg_ref(locR(i));
+        [vRun,aRun,ok] = nearest_at_angle(ang, deg_run(locU), pkU, PN.tol_deg);
+        if ~ok, vRun = circ_interp(deg_run, run_dB, ang); aRun = NaN; end
+        dv = vRun - pkR(i);
+        fprintf('  %6.1f°  %7.2f  %7.2f  %+6.2f  %s\n', ang, pkR(i), vRun, dv, ...
+            ternary(isnan(aRun),'interp',sprintf('%.1f°',aRun)));
+    end
+
+    fprintf('Nulls: (angle)  ref_dB  run_dB  ΔdB  [match]\n');
+    for i=1:numel(lnr)
+        ang = deg_ref(lnr(i));
+        [vRun,aRun,ok] = nearest_at_angle(ang, deg_run(lnu), -nlU, PN.tol_deg);
+        if ~ok, vRun = circ_interp(deg_run, run_dB, ang); aRun = NaN; end
+        vRef = -nlR(i);
+        dv = vRun - vRef;
+        fprintf('  %6.1f°  %7.2f  %7.2f  %+6.2f  %s\n', ang, vRef, vRun, dv, ...
+            ternary(isnan(aRun),'interp',sprintf('%.1f°',aRun)));
+    end
+end
+
+function [val_at_match, angle_match, ok] = nearest_at_angle(target_deg, ang_list, val_list, tol_deg)
+    if isempty(ang_list)
+        val_at_match = NaN; angle_match = NaN; ok = false; return;
+    end
+    d = mod(ang_list - target_deg + 180,360) - 180;
+    [dmin, idx] = min(abs(d));
+    if dmin <= tol_deg
+        val_at_match = val_list(idx);
+        angle_match  = ang_list(idx);
+        ok = true;
+    else
+        val_at_match = NaN; angle_match = NaN; ok = false;
+    end
+end
+
+function v = circ_interp(theta_deg, y, xq_deg)
+    theta = theta_deg(:);
+    y     = y(:);
+    xq    = mod(xq_deg, 360);
+    th_ext = [theta(1)-360; theta; theta(end)+360];
+    y_ext  = [y(end); y; y(1)];
+    v = interp1(th_ext, y_ext, xq, 'linear');
+end
+
+function out = ternary(cond, a, b)
+    if cond, out = a; else, out = b; end
+end
+
+%% ---- LP impulse/step (reference display) ----
+function [t_s, h_imp, s_step] = vna_like_lowpass_impulse(freq_Hz, H_complex, windowName)
+    [f,ix] = sort(freq_Hz(:)); H = H_complex(:); H = H(ix);
+    df  = median(diff(f));
+    fun = (f(1):df:f(end)).';
+    if numel(fun)~=numel(f) || max(abs(f - fun)) > max(1,1e-9*df)
+        Hr = interp1(f, real(H), fun, 'linear','extrap');
+        Hi = interp1(f, imag(H), fun, 'linear','extrap');
+        f  = fun; H = Hr + 1j*Hi;
+    end
+    Fnyq = f(end);
+    Npos = floor(Fnyq/df) + 1;
+    Hpos = zeros(Npos,1);
+    i0 = round(f(1)/df) + 1;
+    i1 = min(i0 + numel(f) - 1, Npos);
+    Hpos(i0:i1) = H(1:(i1-i0+1));
+    switch lower(windowName)
+        case 'hann',   w = hann(Npos);
+        case 'kaiser', w = kaiser(Npos,6);
+        otherwise,     w = ones(Npos,1);
+    end
+    Hpos = Hpos .* w;
+    Hfull = [Hpos; conj(Hpos(end-1:-1:2))];
+    h_imp = ifft(Hfull, 'symmetric');
+    fs = 2*Fnyq; dt = 1/fs;
+    t_s = (0:numel(h_imp)-1).' * dt;
+    s_step = cumsum(h_imp) * dt;
+end

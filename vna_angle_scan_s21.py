@@ -30,7 +30,7 @@ CSV_PATH        = Path("nanovna_pattern_1to3GHz.csv")
 SWEEP_START_HZ  = 1_000_000_000
 SWEEP_STOP_HZ   = 3_000_000_000
 SWEEP_POINTS    = 101              # NanoVNA-friendly; will fallback if device complains
-AVERAGE_SWEEPS  = 3                # <-- NEW: number of sweeps to average per angle
+AVERAGE_SWEEPS  = 10                # <-- NEW: number of sweeps to average per angle
 
 # --- IMPORT YOUR PROJECT DRIVERS ---------------------------------------------
 from MotorController import MotorController  # GRBL wrapper (G1 X..., '?', etc.)
